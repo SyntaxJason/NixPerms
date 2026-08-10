@@ -3,20 +3,18 @@ package de.astranox.nixperms.core.storage;
 import de.astranox.nixperms.core.database.SQLDatabase;
 import de.astranox.nixperms.core.model.UserModel;
 import org.jetbrains.annotations.Nullable;
+
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
 
 public final class UserStorageAdapter implements IUserStorage {
 
     private final SQLDatabase database;
-    private final Executor executor;
 
-    public UserStorageAdapter(SQLDatabase database, Executor executor) {
+    public UserStorageAdapter(SQLDatabase database) {
         this.database = database;
-        this.executor = executor;
     }
 
-    @Override public CompletableFuture<@Nullable UserModel> load(UUID uuid) { return CompletableFuture.supplyAsync(() -> database.getUser(uuid), executor); }
-    @Override public CompletableFuture<Void> save(UserModel model) { return CompletableFuture.runAsync(() -> database.saveUser(model), executor); }
+    @Override public @Nullable UserModel load(UUID uniqueId) { return database.getUser(uniqueId); }
+    @Override public @Nullable UserModel loadByName(String name) { return database.getUserByName(name); }
+    @Override public void save(UserModel model, boolean broadcast) { database.saveUser(model, broadcast); }
 }

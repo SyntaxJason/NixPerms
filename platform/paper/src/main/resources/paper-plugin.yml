@@ -1,0 +1,12 @@
+name: NixPerms
+version: '${project.version}'
+main: de.astranox.nixperms.paper.NixPermsBukkit
+api-version: '1.21'
+load: STARTUP
+authors: [Astranox]
+description: Fast, predictable permissions for modern Minecraft networks.
+
+permissions:
+  nixperms.admin:
+    description: Allows all NixPerms administration commands
+    default: op

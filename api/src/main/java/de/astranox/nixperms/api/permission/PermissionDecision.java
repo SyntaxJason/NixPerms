@@ -1,9 +1,20 @@
 package de.astranox.nixperms.api.permission;
 
+/** The tri-state result of a permission lookup. */
 public enum PermissionDecision {
-    TRUE,
-    FALSE,
+    ALLOW,
+    DENY,
     UNSET;
 
-    public boolean toBoolean() { return this == TRUE; }
+    public boolean allowed() {
+        return this == ALLOW;
+    }
+
+    public boolean isSet() {
+        return this != UNSET;
+    }
+
+    public static PermissionDecision of(boolean value) {
+        return value ? ALLOW : DENY;
+    }
 }

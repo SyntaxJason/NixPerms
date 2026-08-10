@@ -1,51 +1,108 @@
 package de.astranox.nixperms.core.database.repo;
 
-import de.astranox.nixperms.core.database.SQLDatabase;
+import de.astranox.nixperms.api.permission.PermissionDecision;
+import de.astranox.nixperms.api.permission.PermissionRule;
+import de.astranox.nixperms.api.permission.PermissionScope;
 import de.astranox.nixperms.core.database.SqlDialect;
 import de.astranox.nixperms.core.model.UserModel;
-import java.sql.*;
-import java.util.*;
+import org.jetbrains.annotations.Nullable;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
 
 public final class SQLUserRepository {
 
-    private final SQLDatabase db;
+    private static final String SELECT_USER = "SELECT uuid,name,primary_group,secondary_group FROM nixperms_users";
+
     private final SqlDialect dialect;
 
-    public SQLUserRepository(SQLDatabase db, SqlDialect dialect) {
-        this.db = db;
+    public SQLUserRepository(SqlDialect dialect) {
         this.dialect = dialect;
     }
 
-    public UserModel get(UUID uuid) {
-        try (Connection conn = db.getConnection()) {
-            String primaryGroup; String secondaryGroup;
-            try (PreparedStatement ps = conn.prepareStatement("SELECT primary_group,secondary_group FROM nixperms_users WHERE uuid=?")) {
-                ps.setString(1, uuid.toString()); ResultSet rs = ps.executeQuery(); if (!rs.next()) return null;
-                primaryGroup = rs.getString("primary_group"); secondaryGroup = rs.getString("secondary_group");
-            }
-            Map<String, Boolean> permissions = new LinkedHashMap<>();
-            try (PreparedStatement ps = conn.prepareStatement("SELECT node,value FROM nixperms_user_permissions WHERE uuid=?")) {
-                ps.setString(1, uuid.toString()); ResultSet rs = ps.executeQuery(); while (rs.next()) permissions.put(rs.getString("node"), rs.getBoolean("value"));
-            }
-            return new UserModel(uuid, primaryGroup, secondaryGroup, Collections.unmodifiableMap(permissions));
-        } catch (SQLException e) { db.log().error("Failed to get user '{}': {}", uuid, e.getMessage()); return null; }
+    public @Nullable UserModel get(Connection connection, UUID uniqueId) throws SQLException {
+        return find(connection, "uuid=?", uniqueId.toString());
     }
 
-    public void save(UserModel model) {
-        try (Connection conn = db.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                try (PreparedStatement ps = conn.prepareStatement(dialect.upsertUser())) { ps.setString(1, model.uniqueId().toString()); ps.setString(2, model.primaryGroupName()); ps.setString(3, model.secondaryGroupName()); ps.executeUpdate(); }
-                try (PreparedStatement ps = conn.prepareStatement("DELETE FROM nixperms_user_permissions WHERE uuid=?")) { ps.setString(1, model.uniqueId().toString()); ps.executeUpdate(); }
-                if (!model.permissions().isEmpty()) {
-                    try (PreparedStatement ps = conn.prepareStatement("INSERT INTO nixperms_user_permissions (uuid,node,value) VALUES(?,?,?)")) {
-                        for (Map.Entry<String, Boolean> e : model.permissions().entrySet()) { ps.setString(1, model.uniqueId().toString()); ps.setString(2, e.getKey()); ps.setBoolean(3, e.getValue()); ps.addBatch(); }
-                        ps.executeBatch();
-                    }
+    public @Nullable UserModel getByName(Connection connection, String name) throws SQLException {
+        return find(connection, "name_lower=?", name.trim().toLowerCase(Locale.ROOT));
+    }
+
+    public void save(Connection connection, UserModel model) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(dialect.upsertUser())) {
+            statement.setString(1, model.uniqueId().toString());
+            statement.setString(2, model.name());
+            statement.setString(3, model.name() == null ? null : model.name().toLowerCase(Locale.ROOT));
+            statement.setString(4, model.primaryGroupName());
+            statement.setString(5, model.secondaryGroupName());
+            statement.executeUpdate();
+        }
+        replaceRules(connection, model);
+    }
+
+    private @Nullable UserModel find(Connection connection, String condition, String value) throws SQLException {
+        UUID uniqueId;
+        String name;
+        String primary;
+        String secondary;
+        try (PreparedStatement statement = connection.prepareStatement(SELECT_USER + " WHERE " + condition)) {
+            statement.setString(1, value);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) return null;
+                uniqueId = UUID.fromString(result.getString("uuid"));
+                name = result.getString("name");
+                primary = result.getString("primary_group");
+                secondary = result.getString("secondary_group");
+            }
+        }
+        return new UserModel(uniqueId, name, primary, secondary, loadRules(connection, uniqueId));
+    }
+
+    private List<PermissionRule> loadRules(Connection connection, UUID uniqueId) throws SQLException {
+        List<PermissionRule> rules = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT node,value,server_scope,world_scope FROM nixperms_user_rules WHERE uuid=?"
+        )) {
+            statement.setString(1, uniqueId.toString());
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    rules.add(new PermissionRule(
+                            result.getString("node"),
+                            PermissionDecision.of(result.getBoolean("value")),
+                            new PermissionScope(result.getString("server_scope"), result.getString("world_scope"))
+                    ));
                 }
-                conn.commit();
-            } catch (SQLException e) { conn.rollback(); throw e; }
-            finally { conn.setAutoCommit(true); }
-        } catch (SQLException e) { db.log().error("Failed to save user '{}': {}", model.uniqueId(), e.getMessage()); }
+            }
+        }
+        return rules;
+    }
+
+    private void replaceRules(Connection connection, UserModel model) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM nixperms_user_rules WHERE uuid=?"
+        )) {
+            statement.setString(1, model.uniqueId().toString());
+            statement.executeUpdate();
+        }
+        if (model.rules().isEmpty()) return;
+        try (PreparedStatement statement = connection.prepareStatement(
+                "INSERT INTO nixperms_user_rules (uuid,node,value,server_scope,world_scope) VALUES(?,?,?,?,?)"
+        )) {
+            for (PermissionRule rule : model.rules()) {
+                statement.setString(1, model.uniqueId().toString());
+                statement.setString(2, rule.node());
+                statement.setBoolean(3, rule.decision().allowed());
+                statement.setString(4, rule.scope().server());
+                statement.setString(5, rule.scope().world());
+                statement.addBatch();
+            }
+            statement.executeBatch();
+        }
     }
 }

@@ -1,88 +1,78 @@
 package de.astranox.nixperms.core.group;
 
-import de.astranox.nixperms.api.event.EventCause;
-import de.astranox.nixperms.api.event.IEventBus;
-import de.astranox.nixperms.api.event.group.*;
-import de.astranox.nixperms.api.group.IPermissionGroup;
-import de.astranox.nixperms.core.model.*;
-import de.astranox.nixperms.core.storage.IGroupStorage;
+import de.astranox.nixperms.api.group.IGroupEditor;
+import de.astranox.nixperms.core.model.GroupModel;
+import de.astranox.nixperms.core.model.MetaEntryModel;
+import de.astranox.nixperms.core.permission.NixPermissionEditor;
 import org.jetbrains.annotations.Nullable;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.UnaryOperator;
 
-final class NixGroupEditor {
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Locale;
 
-    private final NixGroupManager manager;
-    private final IGroupStorage storage;
-    private final IEventBus eventBus;
+final class NixGroupEditor extends NixPermissionEditor<NixGroupEditor> implements IGroupEditor {
 
-    NixGroupEditor(NixGroupManager manager, IGroupStorage storage, IEventBus eventBus) {
-        this.manager = manager;
-        this.storage = storage;
-        this.eventBus = eventBus;
+    private final GroupModel original;
+    private final List<MetaEntryModel> prefixes;
+    private final List<MetaEntryModel> suffixes;
+    private final Map<String, String> options;
+    @Nullable private String parentName;
+    @Nullable private String defaultSecondaryName;
+    private int weight;
+
+    NixGroupEditor(GroupModel original) {
+        super(original.rules());
+        this.original = original;
+        this.parentName = original.parentName();
+        this.defaultSecondaryName = original.defaultSecondaryName();
+        this.weight = original.weight();
+        this.prefixes = new ArrayList<>(original.prefixes());
+        this.suffixes = new ArrayList<>(original.suffixes());
+        this.options = new LinkedHashMap<>(original.options());
     }
 
-    CompletableFuture<Void> setParent(IPermissionGroup group, @Nullable IPermissionGroup parent) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), m.weight(), parent != null ? parent.name() : null, m.permissions(), m.prefixes(), m.suffixes(), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.PARENT_CHANGED, EventCause.API)));
+    @Override public IGroupEditor parent(String groupName) { parentName = GroupModel.normalizeName(groupName); return this; }
+    @Override public IGroupEditor clearParent() { parentName = null; return this; }
+    @Override public IGroupEditor defaultSecondary(String groupName) { defaultSecondaryName = GroupModel.normalizeName(groupName); return this; }
+    @Override public IGroupEditor clearDefaultSecondary() { defaultSecondaryName = null; return this; }
+    @Override public IGroupEditor weight(int value) { weight = value; return this; }
+
+    @Override
+    public IGroupEditor option(String key, String value) {
+        if (key == null || key.isBlank()) throw new IllegalArgumentException("Option key cannot be blank");
+        if (value == null) throw new IllegalArgumentException("Option value cannot be null");
+        options.put(key.trim().toLowerCase(Locale.ROOT), value);
+        return this;
     }
 
-    CompletableFuture<Void> setPermission(IPermissionGroup group, String node, boolean value) {
-        Boolean previous = group.permissions().asMap().get(node);
-        return mutate(group.name(), m -> { Map<String, Boolean> p = new HashMap<>(m.permissions()); p.put(node, value); return new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), Collections.unmodifiableMap(p), m.prefixes(), m.suffixes(), m.options()); }, () -> eventBus.post(new GroupPermissionChangeEvent(manager.group(group.name()), node, value, previous, EventCause.API)));
+    @Override public IGroupEditor removeOption(String key) { if (key != null) options.remove(key.trim().toLowerCase(Locale.ROOT)); return this; }
+    @Override public IGroupEditor prefix(int priority, String value) { addMeta(prefixes, priority, value); return this; }
+    @Override public IGroupEditor removePrefix(int priority, String value) { removeMeta(prefixes, priority, value); return this; }
+    @Override public IGroupEditor suffix(int priority, String value) { addMeta(suffixes, priority, value); return this; }
+    @Override public IGroupEditor removeSuffix(int priority, String value) { removeMeta(suffixes, priority, value); return this; }
+
+    GroupModel build() {
+        return new GroupModel(
+                original.name(), original.role(), weight, parentName, defaultSecondaryName,
+                buildRules(), sorted(prefixes), sorted(suffixes), options
+        );
     }
 
-    CompletableFuture<Void> unsetPermission(IPermissionGroup group, String node) {
-        Boolean previous = group.permissions().asMap().get(node);
-        return mutate(group.name(), m -> { Map<String, Boolean> p = new HashMap<>(m.permissions()); p.remove(node); return new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), Collections.unmodifiableMap(p), m.prefixes(), m.suffixes(), m.options()); }, () -> eventBus.post(new GroupPermissionChangeEvent(manager.group(group.name()), node, null, previous, EventCause.API)));
+    private void addMeta(List<MetaEntryModel> entries, int priority, String value) {
+        if (value == null || value.isBlank()) throw new IllegalArgumentException("Meta value cannot be blank");
+        entries.removeIf(entry -> entry.priority() == priority && entry.value().equals(value));
+        entries.add(new MetaEntryModel(priority, value));
     }
 
-    CompletableFuture<Void> setOption(IPermissionGroup group, String key, String value) {
-        return mutate(group.name(), m -> { Map<String, String> o = new HashMap<>(m.options()); o.put(key, value); return new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), m.prefixes(), m.suffixes(), Collections.unmodifiableMap(o)); }, () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.OPTION_SET, EventCause.API)));
+    private void removeMeta(List<MetaEntryModel> entries, int priority, String value) {
+        entries.removeIf(entry -> entry.priority() == priority && entry.value().equals(value));
     }
 
-    CompletableFuture<Void> unsetOption(IPermissionGroup group, String key) {
-        return mutate(group.name(), m -> { Map<String, String> o = new HashMap<>(m.options()); o.remove(key); return new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), m.prefixes(), m.suffixes(), Collections.unmodifiableMap(o)); }, () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.OPTION_UNSET, EventCause.API)));
-    }
-
-    CompletableFuture<Void> addPrefix(IPermissionGroup group, int priority, String value) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), withEntry(m.prefixes(), priority, value), m.suffixes(), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.PREFIX_ADDED, EventCause.API)));
-    }
-
-    CompletableFuture<Void> removePrefix(IPermissionGroup group, int priority, String value) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), withoutEntry(m.prefixes(), priority, value), m.suffixes(), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.PREFIX_REMOVED, EventCause.API)));
-    }
-
-    CompletableFuture<Void> addSuffix(IPermissionGroup group, int priority, String value) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), m.prefixes(), withEntry(m.suffixes(), priority, value), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.SUFFIX_ADDED, EventCause.API)));
-    }
-
-    CompletableFuture<Void> removeSuffix(IPermissionGroup group, int priority, String value) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), m.weight(), m.parentName(), m.permissions(), m.prefixes(), withoutEntry(m.suffixes(), priority, value), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.SUFFIX_REMOVED, EventCause.API)));
-    }
-
-    CompletableFuture<Void> setWeight(IPermissionGroup group, int weight) {
-        return mutate(group.name(), m -> new GroupModel(m.name(), m.role(), weight, m.parentName(), m.permissions(), m.prefixes(), m.suffixes(), m.options()), () -> eventBus.post(new GroupMetaChangeEvent(manager.group(group.name()), GroupMetaChangeEvent.MetaChangeType.WEIGHT_CHANGED, EventCause.API)));
-    }
-
-    private CompletableFuture<Void> mutate(String name, UnaryOperator<GroupModel> updater, Runnable postEvent) {
-        GroupModel current = manager.modelFor(name);
-        if (current == null) return CompletableFuture.completedFuture(null);
-        GroupModel updated = updater.apply(current);
-        manager.applyModel(updated);
-        return storage.save(updated).thenRun(postEvent);
-    }
-
-    private List<MetaEntryModel> withEntry(List<MetaEntryModel> existing, int priority, String value) {
-        List<MetaEntryModel> list = new ArrayList<>(existing);
-        list.add(new MetaEntryModel(priority, value));
-        list.sort(Comparator.comparingInt(MetaEntryModel::priority).reversed());
-        return List.copyOf(list);
-    }
-
-    private List<MetaEntryModel> withoutEntry(List<MetaEntryModel> existing, int priority, String value) {
-        List<MetaEntryModel> list = new ArrayList<>(existing);
-        list.removeIf(e -> e.priority() == priority && e.value().equals(value));
-        return List.copyOf(list);
+    private List<MetaEntryModel> sorted(List<MetaEntryModel> entries) {
+        return entries.stream()
+                .sorted((first, second) -> Integer.compare(second.priority(), first.priority()))
+                .toList();
     }
 }

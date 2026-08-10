@@ -38,8 +38,8 @@ public final class MessageService implements IMessageService {
 
     private TagResolver buildResolver(Map<String, String> placeholders, NixCommandSender sender) {
         List<TagResolver> resolvers = new ArrayList<>();
-        placeholders.forEach((key, value) -> resolvers.add(Placeholder.parsed(key, value)));
-        resolvers.add(Placeholder.parsed("cmd", sender.platform().commandPrefix() + "nixperms"));
+        placeholders.forEach((key, value) -> resolvers.add(Placeholder.unparsed(key, value)));
+        resolvers.add(Placeholder.unparsed("cmd", sender.platform().commandPrefix() + "nixperms"));
         return TagResolver.resolver(resolvers);
     }
 }

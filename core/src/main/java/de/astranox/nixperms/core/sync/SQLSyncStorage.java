@@ -10,7 +10,7 @@ public final class SQLSyncStorage {
     public SQLSyncStorage(SQLDatabase db) { this.db = db; }
 
     public void publish(SyncMessage message) { db.publishSync(message); }
-    public List<SyncMessage> pollSince(long lastId, long maxAgeMs) { return db.pollSync(lastId, maxAgeMs); }
-    public void cleanup(long maxAgeMs) { db.cleanupSync(maxAgeMs); }
+    public List<SyncMessage> pollSince(long lastId) { return db.pollSync(lastId); }
+    public int cleanup(long maxAgeMs) { return db.cleanupSync(maxAgeMs); }
     public long latestId() { return db.latestSyncId(); }
 }

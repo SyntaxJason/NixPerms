@@ -5,32 +5,20 @@
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>de.astranox.nixperms</groupId>
-        <artifactId>NixPerms</artifactId>
-        <version>1.0-EXPERIMENTAL</version>
+        <artifactId>nixperms-parent</artifactId>
+        <version>0.1.0</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
-    <artifactId>platform</artifactId>
+    <artifactId>nixperms-platforms</artifactId>
     <packaging>pom</packaging>
 
+    <name>NixPerms Platforms</name>
+
     <modules>
-        <module>bungeecord</module>
+        <module>common</module>
         <module>paper</module>
-        <module>spigot</module>
+        <module>bungeecord</module>
         <module>velocity</module>
     </modules>
-
-    <properties>
-        <maven.compiler.source>16</maven.compiler.source>
-        <maven.compiler.target>16</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-
-    <dependencies>
-        <dependency>
-            <groupId>${project.groupId}</groupId>
-            <artifactId>core</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-    </dependencies>
-
 </project>

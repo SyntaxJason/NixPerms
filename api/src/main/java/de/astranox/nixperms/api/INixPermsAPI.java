@@ -8,6 +8,8 @@ import de.astranox.nixperms.api.sync.ISyncNotifier;
 import de.astranox.nixperms.api.user.IUserManager;
 
 public interface INixPermsAPI {
+    String version();
+    String serverId();
     IUserManager users();
     IGroupManager groups();
     IAttachmentService attachments();

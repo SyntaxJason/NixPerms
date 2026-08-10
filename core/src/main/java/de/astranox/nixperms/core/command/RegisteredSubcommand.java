@@ -9,37 +9,50 @@ import de.astranox.nixperms.api.annotation.command.Usage;
 import de.astranox.nixperms.api.command.NixCommandSender;
 import de.astranox.nixperms.api.group.GroupRole;
 import de.astranox.nixperms.api.group.IPermissionGroup;
+import de.astranox.nixperms.api.permission.PermissionRule;
 import de.astranox.nixperms.api.user.INixUser;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 final class RegisteredSubcommand {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RegisteredSubcommand.class);
 
     private final Object instance;
     private final Subcommand annotation;
     private final INixPermsAPI api;
-    private final Object2ObjectOpenHashMap<String, Method> actions = new Object2ObjectOpenHashMap<>();
-    private final Object2ObjectOpenHashMap<String, Method> aliases = new Object2ObjectOpenHashMap<>();
+    private final PermissionNodeCatalog permissionCatalog;
+    private final ConcurrentHashMap<String, Method> actions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Method> aliases = new ConcurrentHashMap<>();
 
-    RegisteredSubcommand(Object instance, Subcommand annotation, INixPermsAPI api) {
+    RegisteredSubcommand(
+            Object instance,
+            Subcommand annotation,
+            INixPermsAPI api,
+            PermissionNodeCatalog permissionCatalog
+    ) {
         this.instance = instance;
         this.annotation = annotation;
         this.api = api;
+        this.permissionCatalog = permissionCatalog;
 
         for (Method method : instance.getClass().getDeclaredMethods()) {
             Action action = method.getAnnotation(Action.class);
             if (action == null) continue;
-
-            actions.put(action.value().toLowerCase(), method);
-            for (String alias : action.aliases()) {
-                aliases.put(alias.toLowerCase(), method);
-            }
+            actions.put(action.value().toLowerCase(Locale.ROOT), method);
+            for (String alias : action.aliases()) aliases.put(alias.toLowerCase(Locale.ROOT), method);
         }
     }
 
@@ -48,7 +61,6 @@ final class RegisteredSubcommand {
             api.messages().send(sender, "commands.no-permission", Map.of());
             return;
         }
-
         if (args.length < 2) {
             api.messages().send(sender, "commands." + annotation.label() + ".usage", Map.of());
             return;
@@ -56,184 +68,167 @@ final class RegisteredSubcommand {
 
         ResolvedAction resolvedAction = resolveAction(args);
         if (resolvedAction == null) {
-            api.messages().send(sender, "commands.unknown-action", Map.of("input", args.length > 1 ? args[1] : "?"));
+            api.messages().send(sender, "commands.unknown-action", Map.of(
+                    "input", args.length > 1 ? args[1] : "?"
+            ));
             return;
         }
 
-        NixCommandContext ctx = new NixCommandContext(sender, args, api);
-        Object[] resolvedArgs = resolveArgs(resolvedAction.method(), ctx, args, resolvedAction.actionIndex());
-
+        NixCommandContext context = new NixCommandContext(sender, args, api);
+        Object[] resolvedArgs = resolveArgs(
+                resolvedAction.method(), context, args, resolvedAction.actionIndex()
+        );
         if (resolvedArgs == null) {
             Usage usage = resolvedAction.method().getAnnotation(Usage.class);
-            api.messages().send(
-                    sender,
-                    "commands." + annotation.label() + "." + resolvedAction.actionName() + ".usage",
-                    usage != null ? Map.of("usage", usage.value()) : Map.of()
-            );
+            api.messages().send(sender, "commands.action-usage", Map.of(
+                    "command", commandPath(resolvedAction),
+                    "arguments", usageArguments(usage)
+            ));
             return;
         }
 
         try {
             resolvedAction.method().setAccessible(true);
             resolvedAction.method().invoke(instance, resolvedArgs);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
+        } catch (InvocationTargetException exception) {
+            Throwable cause = exception.getCause() != null ? exception.getCause() : exception;
             api.messages().send(sender, "commands.error", Map.of(
                     "error", cause.getMessage() != null ? cause.getMessage() : "unknown"
             ));
-            cause.printStackTrace();
-        } catch (Exception e) {
+            LOGGER.warn("NixPerms command failed", cause);
+        } catch (Exception exception) {
             api.messages().send(sender, "commands.error", Map.of(
-                    "error", e.getMessage() != null ? e.getMessage() : "unknown"
+                    "error", exception.getMessage() != null ? exception.getMessage() : "unknown"
             ));
-            e.printStackTrace();
+            LOGGER.warn("NixPerms command dispatch failed", exception);
         }
     }
 
     List<String> suggest(NixCommandSender sender, String[] args) {
-        if (args.length <= 1) {
-            return List.of();
-        }
-
-        if (args.length == 2) {
-            return NixCommandSuggestions.filter(actions.keySet(), args[1]);
-        }
-
+        if (!sender.hasPermission(annotation.permission()) || args.length <= 1) return List.of();
+        if (args.length == 2) return NixCommandSuggestions.filter(actions.keySet(), args[1]);
         if (args.length == 3 && !isAction(args[1])) {
             return NixCommandSuggestions.filter(actions.keySet(), args[2]);
         }
 
         ResolvedAction resolvedAction = resolveAction(args);
-        if (resolvedAction == null) {
-            return List.of();
-        }
+        if (resolvedAction == null) return NixCommandSuggestions.filter(actions.keySet(), args[1]);
+        return suggestArg(resolvedAction, args, sender);
+    }
 
-        return suggestArg(resolvedAction.method(), args, resolvedAction.actionIndex());
+    private String commandPath(ResolvedAction action) {
+        return "/nixperms " + annotation.label() + " " + action.actionName();
+    }
+
+    private String usageArguments(Usage usage) {
+        return usage == null ? "" : usage.value();
     }
 
     private ResolvedAction resolveAction(String[] args) {
-        Method methodAt1 = findMethod(args[1]);
-        if (methodAt1 != null) {
-            return new ResolvedAction(args[1].toLowerCase(), methodAt1, 1);
+        Method methodAtOne = findMethod(args[1]);
+        if (methodAtOne != null) {
+            return new ResolvedAction(actionName(methodAtOne), methodAtOne, 1);
         }
+        if (args.length < 3) return null;
+        Method methodAtTwo = findMethod(args[2]);
+        if (methodAtTwo == null) return null;
+        return new ResolvedAction(actionName(methodAtTwo), methodAtTwo, 2);
+    }
 
-        if (args.length >= 3) {
-            Method methodAt2 = findMethod(args[2]);
-            if (methodAt2 != null) {
-                return new ResolvedAction(args[2].toLowerCase(), methodAt2, 2);
-            }
-        }
-
-        return null;
+    private String actionName(Method method) {
+        return method.getAnnotation(Action.class).value().toLowerCase(Locale.ROOT);
     }
 
     private Method findMethod(String input) {
-        String key = input.toLowerCase();
+        String key = input.toLowerCase(Locale.ROOT);
         Method method = actions.get(key);
-        if (method != null) return method;
-        return aliases.get(key);
+        return method != null ? method : aliases.get(key);
     }
 
     private boolean isAction(String input) {
         return findMethod(input) != null;
     }
 
-    private Object[] resolveArgs(Method method, NixCommandContext ctx, String[] rawArgs, int actionIndex) {
-        Parameter[] params = method.getParameters();
-        Object[] resolved = new Object[params.length];
-        int logicalArgPosition = 0;
+    private Object[] resolveArgs(Method method, NixCommandContext context, String[] rawArgs, int actionIndex) {
+        Parameter[] parameters = method.getParameters();
+        Object[] resolved = new Object[parameters.length];
+        int logicalPosition = 0;
+        int argumentCount = (int) Arrays.stream(parameters)
+                .filter(parameter -> parameter.isAnnotationPresent(Arg.class))
+                .count();
 
-        for (int i = 0; i < params.length; i++) {
-            Parameter param = params[i];
-
-            if (NixCommandContext.class.isAssignableFrom(param.getType())) {
-                resolved[i] = ctx;
+        for (int index = 0; index < parameters.length; index++) {
+            Parameter parameter = parameters[index];
+            if (NixCommandContext.class.isAssignableFrom(parameter.getType())) {
+                resolved[index] = context;
                 continue;
             }
 
-            Arg argAnnotation = param.getAnnotation(Arg.class);
-            if (argAnnotation == null) {
-                return null;
-            }
-
-            int rawIndex = mapRawIndex(actionIndex, logicalArgPosition);
-            logicalArgPosition++;
-
+            Arg argument = parameter.getAnnotation(Arg.class);
+            if (argument == null) return null;
+            int rawIndex = mapRawIndex(actionIndex, logicalPosition++);
             String raw = rawIndex < rawArgs.length ? rawArgs[rawIndex] : null;
-            if (raw == null && argAnnotation.required() && argAnnotation.def().isEmpty()) {
-                return null;
+            if (raw != null && logicalPosition == argumentCount && trailingString(parameter, argument)) {
+                raw = String.join(" ", Arrays.copyOfRange(rawArgs, rawIndex, rawArgs.length));
             }
+            if (raw == null && argument.required() && argument.def().isEmpty()) return null;
 
-            String value = raw != null ? raw : argAnnotation.def();
-            Object resolvedValue = resolveArgValue(param.getType(), argAnnotation, value, ctx);
-
-            if (resolvedValue == null && argAnnotation.required()) {
-                return null;
-            }
-
-            resolved[i] = resolvedValue;
+            String value = raw != null ? raw : argument.def();
+            Object resolvedValue = resolveArgValue(parameter.getType(), argument, value, context);
+            if (resolvedValue == null && argument.required()) return null;
+            resolved[index] = resolvedValue;
         }
-
         return resolved;
     }
 
-    private int mapRawIndex(int actionIndex, int logicalArgPosition) {
-        if (actionIndex == 1) {
-            return 2 + logicalArgPosition;
-        }
-
-        if (logicalArgPosition == 0) {
-            return 1;
-        }
-
-        return 2 + logicalArgPosition;
+    private int mapRawIndex(int actionIndex, int logicalPosition) {
+        if (actionIndex == 1) return 2 + logicalPosition;
+        if (logicalPosition == 0) return 1;
+        return 2 + logicalPosition;
     }
 
-    private Object resolveArgValue(Class<?> type, Arg annotation, String value, NixCommandContext ctx) {
-        ArgType argType = annotation.type();
-        if (argType == ArgType.AUTO) {
-            argType = detectType(type);
-        }
-
+    private Object resolveArgValue(Class<?> type, Arg annotation, String value, NixCommandContext context) {
+        ArgType argType = annotation.type() == ArgType.AUTO ? detectType(type) : annotation.type();
         return switch (argType) {
             case STRING, PERMISSION_NODE -> value;
-            case INT -> {
-                try {
-                    yield Integer.parseInt(value);
-                } catch (NumberFormatException e) {
-                    yield null;
-                }
-            }
-            case BOOLEAN -> Boolean.parseBoolean(value);
-            case DOUBLE -> {
-                try {
-                    yield Double.parseDouble(value);
-                } catch (NumberFormatException e) {
-                    yield null;
-                }
-            }
-            case GROUP -> ctx.api().groups().group(value);
-            case USER -> {
-                UUID uuid = uuidOrNull(value);
-                if (uuid != null) {
-                    yield ctx.api().users().getUser(uuid);
-                }
-
-                yield ctx.api().users().loaded().stream()
-                        .filter(user -> user.name() != null)
-                        .filter(user -> user.name().equalsIgnoreCase(value))
-                        .findFirst()
-                        .orElse(null);
-            }
-            case GROUP_ROLE -> {
-                try {
-                    yield GroupRole.valueOf(value.toUpperCase());
-                } catch (IllegalArgumentException e) {
-                    yield null;
-                }
-            }
+            case INT -> integer(value);
+            case BOOLEAN -> bool(value);
+            case DOUBLE -> decimal(value);
+            case GROUP -> context.api().groups().group(value);
+            case USER -> loadedUser(value);
+            case GROUP_ROLE -> groupRole(value);
             default -> value;
         };
+    }
+
+    private Integer integer(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Boolean bool(String value) {
+        if ("true".equalsIgnoreCase(value)) return true;
+        if ("false".equalsIgnoreCase(value)) return false;
+        return null;
+    }
+
+    private Double decimal(String value) {
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private GroupRole groupRole(String value) {
+        try {
+            return GroupRole.valueOf(value.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
     }
 
     private ArgType detectType(Class<?> type) {
@@ -247,58 +242,150 @@ final class RegisteredSubcommand {
         return ArgType.STRING;
     }
 
-    private List<String> suggestArg(Method method, String[] args, int actionIndex) {
-        Parameter[] params = method.getParameters();
-        int logicalArgPosition = 0;
+    private boolean trailingString(Parameter parameter, Arg annotation) {
+        ArgType type = annotation.type() == ArgType.AUTO ? detectType(parameter.getType()) : annotation.type();
+        return type == ArgType.STRING;
+    }
 
-        for (Parameter param : params) {
-            if (NixCommandContext.class.isAssignableFrom(param.getType())) {
-                continue;
-            }
+    private List<String> suggestArg(ResolvedAction action, String[] args, NixCommandSender sender) {
+        Parameter[] parameters = action.method().getParameters();
+        int logicalPosition = 0;
+        for (Parameter parameter : parameters) {
+            if (NixCommandContext.class.isAssignableFrom(parameter.getType())) continue;
+            Arg argument = parameter.getAnnotation(Arg.class);
+            if (argument == null) continue;
 
-            Arg argAnnotation = param.getAnnotation(Arg.class);
-            if (argAnnotation == null) {
-                continue;
-            }
+            int rawIndex = mapRawIndex(action.actionIndex(), logicalPosition++);
+            if (rawIndex != args.length - 1) continue;
+            ArgType type = suggestionType(parameter, argument);
+            String input = args[rawIndex];
 
-            int rawIndex = mapRawIndex(actionIndex, logicalArgPosition);
-            logicalArgPosition++;
-
-            if (rawIndex != args.length - 1) {
-                continue;
-            }
-
-            ArgType argType = argAnnotation.type() == ArgType.AUTO
-                    ? detectType(param.getType())
-                    : argAnnotation.type();
-
-            return switch (argType) {
-                case GROUP -> NixCommandSuggestions.filter(
-                        api.groups().loaded().stream().map(IPermissionGroup::name).toList(),
-                        args[rawIndex]
+            return switch (type) {
+                case GROUP -> suggestGroups(action, argument, input);
+                case USER -> NixCommandSuggestions.filter(userNames(sender), input);
+                case GROUP_ROLE -> NixCommandSuggestions.filter(List.of("PRIMARY", "SECONDARY"), input);
+                case BOOLEAN -> NixCommandSuggestions.filter(List.of("true", "false"), input);
+                case PERMISSION_NODE -> NixCommandSuggestions.filterPermissionTree(
+                        permissionCandidates(action, args), input
                 );
-                case USER -> NixCommandSuggestions.filter(
-                        api.users().loaded().stream()
-                                .map(user -> user.name() != null ? user.name() : user.uniqueId().toString())
-                                .toList(),
-                        args[rawIndex]
-                );
-                case GROUP_ROLE -> NixCommandSuggestions.filter(List.of("PRIMARY", "SECONDARY"), args[rawIndex]);
-                case BOOLEAN -> NixCommandSuggestions.filter(List.of("true", "false"), args[rawIndex]);
                 default -> List.of();
             };
         }
-
         return List.of();
+    }
+
+    private ArgType suggestionType(Parameter parameter, Arg argument) {
+        if (argument.type() != ArgType.AUTO) return argument.type();
+        if ("user".equalsIgnoreCase(argument.value()) && annotation.label().equalsIgnoreCase("user")) {
+            return ArgType.USER;
+        }
+        return detectType(parameter.getType());
+    }
+
+    private List<String> suggestGroups(ResolvedAction action, Arg argument, String input) {
+        Collection<IPermissionGroup> groups = api.groups().loaded();
+        String argumentName = argument.value().toLowerCase(Locale.ROOT);
+        GroupRole role = null;
+        if (argumentName.contains("secondary") || action.actionName().equals("setsecondary")) {
+            role = GroupRole.SECONDARY;
+        }
+        if (argumentName.contains("primary") || action.actionName().equals("setgroup")) {
+            role = GroupRole.PRIMARY;
+        }
+        GroupRole expected = role;
+        return NixCommandSuggestions.filter(
+                groups.stream()
+                        .filter(group -> expected == null || group.role() == expected)
+                        .map(IPermissionGroup::name)
+                        .toList(),
+                input
+        );
+    }
+
+    private Collection<String> permissionCandidates(ResolvedAction action, String[] args) {
+        if (!action.actionName().equals("delperm")) return permissionCatalog.nodes();
+        int ownerIndex = mapRawIndex(action.actionIndex(), 0);
+        if (ownerIndex >= args.length) return permissionCatalog.nodes();
+
+        String owner = args[ownerIndex];
+        if (annotation.label().equalsIgnoreCase("group")) {
+            IPermissionGroup group = api.groups().group(owner);
+            if (group != null) return group.rules().stream().map(PermissionRule::node).toList();
+        }
+        if (annotation.label().equalsIgnoreCase("user")) {
+            INixUser user = loadedUser(owner);
+            if (user != null) return user.ownRules().stream().map(PermissionRule::node).toList();
+        }
+        return permissionCatalog.nodes();
+    }
+
+    private List<String> userNames(NixCommandSender sender) {
+        TreeSet<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        api.users().loaded().forEach(user -> {
+            if (user.name() != null && !user.name().isBlank()) names.add(user.name());
+        });
+        if (sender.isPlayer() && sender.name() != null && !sender.name().isBlank()) {
+            names.add(sender.name());
+        }
+        discoverBukkitUserNames(names);
+        discoverBungeeUserNames(names);
+        return List.copyOf(names);
+    }
+
+    private void discoverBukkitUserNames(Collection<String> names) {
+        try {
+            Class<?> bukkit = Class.forName(
+                    "org.bukkit.Bukkit", false, RegisteredSubcommand.class.getClassLoader()
+            );
+            Object onlinePlayers = bukkit.getMethod("getOnlinePlayers").invoke(null);
+            addNames(names, onlinePlayers, "getName");
+        } catch (ReflectiveOperationException | LinkageError | SecurityException ignored) {
+            // Not running on Bukkit/Paper.
+        }
+    }
+
+    private void discoverBungeeUserNames(Collection<String> names) {
+        try {
+            Class<?> proxyType = Class.forName(
+                    "net.md_5.bungee.api.ProxyServer", false, RegisteredSubcommand.class.getClassLoader()
+            );
+            Object proxy = proxyType.getMethod("getInstance").invoke(null);
+            Object onlinePlayers = proxyType.getMethod("getPlayers").invoke(proxy);
+            addNames(names, onlinePlayers, "getName");
+        } catch (ReflectiveOperationException | LinkageError | SecurityException ignored) {
+            // Not running on BungeeCord.
+        }
+    }
+
+    private void addNames(Collection<String> names, Object players, String accessor) {
+        if (!(players instanceof Iterable<?> iterable)) return;
+        for (Object player : iterable) {
+            try {
+                Object name = player.getClass().getMethod(accessor).invoke(player);
+                if (name != null && !String.valueOf(name).isBlank()) names.add(String.valueOf(name));
+            } catch (ReflectiveOperationException | LinkageError | SecurityException ignored) {
+                // Ignore one incompatible platform object and continue with the remaining players.
+            }
+        }
+    }
+
+    private INixUser loadedUser(String value) {
+        UUID uuid = uuidOrNull(value);
+        if (uuid != null) return api.users().getUser(uuid);
+        return api.users().loaded().stream()
+                .filter(user -> user.name() != null)
+                .filter(user -> user.name().equalsIgnoreCase(value))
+                .findFirst()
+                .orElse(null);
     }
 
     private UUID uuidOrNull(String value) {
         try {
             return UUID.fromString(value);
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException ignored) {
             return null;
         }
     }
 
-    private record ResolvedAction(String actionName, Method method, int actionIndex) {}
+    private record ResolvedAction(String actionName, Method method, int actionIndex) { }
 }

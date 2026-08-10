@@ -1,0 +1,27 @@
+# Unique on every Paper, Spigot, Velocity or BungeeCord instance.
+# On proxies, SERVER-scoped rules use the current backend server name.
+server-id: node-1
+
+permissions:
+  default-group: default
+  # PRIMARY_WINS, SECONDARY_WINS or DENY_WINS
+  resolution-policy: PRIMARY_WINS
+
+database:
+  # sqlite, mysql, mariadb or postgresql
+  type: sqlite
+  sqlite-file: nixperms.db
+
+  host: 127.0.0.1
+  port: 3306
+  name: nixperms
+  username: nixperms
+  password: change-me
+  pool-size: 10
+  threads: 4
+
+network:
+  # Requires the same MySQL, MariaDB or PostgreSQL database on all nodes.
+  enabled: false
+  poll-interval-ms: 1000
+  retention-seconds: 300

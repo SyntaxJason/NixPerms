@@ -10,6 +10,8 @@ import de.astranox.nixperms.api.group.IPermissionGroup;
 import de.astranox.nixperms.core.command.NixCommandContext;
 
 import java.util.Set;
+import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
 
 @Subcommand(label = "group", aliases = {"g"})
 public final class GroupSubcommand {
@@ -22,6 +24,10 @@ public final class GroupSubcommand {
             "removeperm",
             "setparent",
             "clearparent",
+            "setdefaultsecondary",
+            "setdefault",
+            "cleardefaultsecondary",
+            "cleardefault",
             "setweight",
             "addprefix",
             "addsuffix",
@@ -40,12 +46,12 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().create(name, role).thenRun(() ->
+        run(ctx, ctx.api().groups().create(name, role).thenRun(() ->
                 ctx.reply("commands.group.create.success")
                         .with("group", name)
                         .with("role", role.name())
                         .send()
-        );
+        ));
     }
 
     @Action("delete")
@@ -57,11 +63,11 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().delete(group).thenRun(() ->
+        run(ctx, ctx.api().groups().delete(group).thenRun(() ->
                 ctx.reply("commands.group.delete.success")
                         .with("group", group.name())
                         .send()
-        );
+        ));
     }
 
     @Action("addperm")
@@ -75,13 +81,13 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().setPermission(group, node, value).thenRun(() ->
+        run(ctx, ctx.api().groups().setPermission(group, node, value).thenRun(() ->
                 ctx.reply("commands.group.addperm.success")
                         .with("group", group.name())
                         .with("node", node)
                         .with("value", String.valueOf(value))
                         .send()
-        );
+        ));
     }
 
     @Action(value = "delperm", aliases = {"removeperm"})
@@ -94,12 +100,12 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().unsetPermission(group, node).thenRun(() ->
+        run(ctx, ctx.api().groups().unsetPermission(group, node).thenRun(() ->
                 ctx.reply("commands.group.delperm.success")
                         .with("group", group.name())
                         .with("node", node)
                         .send()
-        );
+        ));
     }
 
     @Action("setparent")
@@ -117,12 +123,12 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().setParent(group, parent).thenRun(() ->
+        run(ctx, ctx.api().groups().setParent(group, parent).thenRun(() ->
                 ctx.reply("commands.group.setparent.success")
                         .with("group", group.name())
                         .with("parent", parent.name())
                         .send()
-        );
+        ));
     }
 
     @Action("clearparent")
@@ -134,12 +140,53 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().setParent(group, null).thenRun(() ->
+        run(ctx, ctx.api().groups().setParent(group, null).thenRun(() ->
                 ctx.reply("commands.group.setparent.success")
                         .with("group", group.name())
                         .with("parent", "none")
                         .send()
-        );
+        ));
+    }
+
+    @Action(value = "setdefaultsecondary", aliases = {"setdefault"})
+    @Usage("<primary> <secondary>")
+    public void setDefaultSecondary(
+            NixCommandContext ctx,
+            @Arg(value = "primary", type = ArgType.GROUP) IPermissionGroup primary,
+            @Arg(value = "secondary", type = ArgType.GROUP) IPermissionGroup secondary
+    ) {
+        if (primary == null || secondary == null) {
+            ctx.reply("commands.group.not-found")
+                    .with("group", primary == null ? firstGroupInput(ctx) : secondGroupInput(ctx))
+                    .send();
+            return;
+        }
+
+        run(ctx, primary.edit(editor -> editor.defaultSecondary(secondary.name())).thenRun(() ->
+                ctx.reply("commands.group.setdefaultsecondary.success")
+                        .with("group", primary.name())
+                        .with("secondary", secondary.name())
+                        .send()
+        ));
+    }
+
+    @Action(value = "cleardefaultsecondary", aliases = {"cleardefault"})
+    @Usage("<primary>")
+    public void clearDefaultSecondary(
+            NixCommandContext ctx,
+            @Arg(value = "primary", type = ArgType.GROUP) IPermissionGroup primary
+    ) {
+        if (primary == null) {
+            ctx.reply("commands.group.not-found").with("group", firstGroupInput(ctx)).send();
+            return;
+        }
+
+        run(ctx, primary.edit(editor -> editor.clearDefaultSecondary()).thenRun(() ->
+                ctx.reply("commands.group.setdefaultsecondary.success")
+                        .with("group", primary.name())
+                        .with("secondary", "none")
+                        .send()
+        ));
     }
 
     @Action("setweight")
@@ -152,12 +199,12 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().setWeight(group, weight).thenRun(() ->
+        run(ctx, ctx.api().groups().setWeight(group, weight).thenRun(() ->
                 ctx.reply("commands.group.setweight.success")
                         .with("group", group.name())
                         .with("weight", String.valueOf(weight))
                         .send()
-        );
+        ));
     }
 
     @Action("addprefix")
@@ -171,13 +218,13 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().addPrefix(group, priority, prefix).thenRun(() ->
+        run(ctx, ctx.api().groups().addPrefix(group, priority, prefix).thenRun(() ->
                 ctx.reply("commands.group.addperm.success")
                         .with("group", group.name())
                         .with("node", "prefix@" + priority)
                         .with("value", prefix)
                         .send()
-        );
+        ));
     }
 
     @Action("addsuffix")
@@ -191,13 +238,13 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().addSuffix(group, priority, suffix).thenRun(() ->
+        run(ctx, ctx.api().groups().addSuffix(group, priority, suffix).thenRun(() ->
                 ctx.reply("commands.group.addperm.success")
                         .with("group", group.name())
                         .with("node", "suffix@" + priority)
                         .with("value", suffix)
                         .send()
-        );
+        ));
     }
 
     @Action("setoption")
@@ -211,13 +258,13 @@ public final class GroupSubcommand {
             return;
         }
 
-        ctx.api().groups().setOption(group, key, value).thenRun(() ->
+        run(ctx, ctx.api().groups().setOption(group, key, value).thenRun(() ->
                 ctx.reply("commands.group.addperm.success")
                         .with("group", group.name())
                         .with("node", key)
                         .with("value", value)
                         .send()
-        );
+        ));
     }
 
     @Action("info")
@@ -234,6 +281,7 @@ public final class GroupSubcommand {
                 .with("role", group.role().name())
                 .with("weight", String.valueOf(group.weight()))
                 .with("parent", group.parent().map(IPermissionGroup::name).orElse("none"))
+                .with("default_secondary", group.defaultSecondary().map(IPermissionGroup::name).orElse("none"))
                 .send();
 
         group.permissions().asMap().forEach((node, value) ->
@@ -257,11 +305,20 @@ public final class GroupSubcommand {
 
     private String firstGroupInput(NixCommandContext ctx) {
         String first = ctx.arg(1).orElse("?");
-        if (!ACTIONS.contains(first.toLowerCase())) return first;
+        if (!ACTIONS.contains(first.toLowerCase(Locale.ROOT))) return first;
         return ctx.arg(2).orElse("?");
     }
 
     private String secondGroupInput(NixCommandContext ctx) {
         return ctx.arg(3).orElse("?");
+    }
+
+    private void run(NixCommandContext context, CompletableFuture<?> operation) {
+        operation.exceptionally(error -> {
+            Throwable cause = error.getCause() == null ? error : error.getCause();
+            String message = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+            context.reply("commands.error").with("error", message).send();
+            return null;
+        });
     }
 }

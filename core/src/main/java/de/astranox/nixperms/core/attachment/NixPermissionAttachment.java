@@ -1,43 +1,67 @@
 package de.astranox.nixperms.core.attachment;
 
+import de.astranox.nixperms.api.attachment.IAttachmentEditor;
 import de.astranox.nixperms.api.attachment.IPermissionAttachment;
-import de.astranox.nixperms.api.event.IEventBus;
-import it.unimi.dsi.fastutil.objects.Object2BooleanOpenHashMap;
-import java.util.Map;
+import de.astranox.nixperms.api.permission.PermissionRule;
+
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 public final class NixPermissionAttachment implements IPermissionAttachment {
 
-    private final UUID uniqueId;
+    private final UUID uniqueId = UUID.randomUUID();
     private final UUID subjectId;
-    private final String ownerKey;
-    private final Object2BooleanOpenHashMap<String> permissions = new Object2BooleanOpenHashMap<>();
-    private final Runnable onInvalidate;
+    private final String key;
+    private final int priority;
+    private final long sequence;
+    private final NixUserAttachments owner;
+    private final AtomicBoolean active = new AtomicBoolean(true);
+    private volatile List<PermissionRule> rules;
 
-    public NixPermissionAttachment(UUID subjectId, String ownerKey, Runnable onInvalidate) {
-        this.uniqueId = UUID.randomUUID();
+    NixPermissionAttachment(
+            UUID subjectId,
+            String key,
+            int priority,
+            long sequence,
+            Collection<PermissionRule> initialRules,
+            NixUserAttachments owner
+    ) {
         this.subjectId = subjectId;
-        this.ownerKey = ownerKey;
-        this.onInvalidate = onInvalidate;
+        this.key = key;
+        this.priority = priority;
+        this.sequence = sequence;
+        this.rules = List.copyOf(initialRules);
+        this.owner = owner;
     }
 
     @Override public UUID uniqueId() { return uniqueId; }
     @Override public UUID subjectId() { return subjectId; }
-    @Override public String ownerKey() { return ownerKey; }
-    @Override public Map<String, Boolean> permissions() { return permissions; }
+    @Override public String key() { return key; }
+    @Override public int priority() { return priority; }
+    @Override public long sequence() { return sequence; }
+    @Override public boolean active() { return active.get(); }
+    @Override public Collection<PermissionRule> rules() { return rules; }
 
     @Override
-    public CompletableFuture<Void> setPermission(String node, boolean value) {
-        permissions.put(node, value);
-        return CompletableFuture.completedFuture(null);
+    public synchronized IPermissionAttachment edit(Consumer<IAttachmentEditor> change) {
+        if (!active()) throw new IllegalStateException("Attachment is no longer active: " + key);
+        if (change == null) throw new IllegalArgumentException("Attachment editor cannot be null");
+        NixAttachmentEditor editor = new NixAttachmentEditor(rules);
+        change.accept(editor);
+        rules = editor.buildRules();
+        owner.refresh();
+        return this;
     }
 
     @Override
-    public CompletableFuture<Void> unsetPermission(String node) {
-        permissions.remove(node);
-        return CompletableFuture.completedFuture(null);
+    public void close() {
+        owner.remove(this);
     }
 
-    @Override public void invalidate() { onInvalidate.run(); }
+    void deactivate() {
+        active.set(false);
+    }
 }

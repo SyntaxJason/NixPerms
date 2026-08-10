@@ -1,41 +1,66 @@
 package de.astranox.nixperms.core.database.repo;
 
-import de.astranox.nixperms.core.database.SQLDatabase;
 import de.astranox.nixperms.core.sync.SyncMessage;
-import java.sql.*;
-import java.util.*;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class SQLSyncRepository {
 
-    private final SQLDatabase db;
-
-    public SQLSyncRepository(SQLDatabase db) { this.db = db; }
-
-    public void publish(SyncMessage message) {
-        try (Connection conn = db.getConnection(); PreparedStatement ps = conn.prepareStatement("INSERT INTO nixperms_sync (server_id,type,payload,created_at) VALUES(?,?,?,?)")) {
-            ps.setString(1, message.serverId()); ps.setString(2, message.type()); ps.setString(3, message.payload()); ps.setLong(4, System.currentTimeMillis()); ps.executeUpdate();
-        } catch (SQLException e) { db.log().error("Failed to publish sync: {}", e.getMessage()); }
+    public void publish(Connection connection, SyncMessage message) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "INSERT INTO nixperms_sync (server_id,type,payload,created_at) VALUES(?,?,?,?)"
+        )) {
+            statement.setString(1, message.serverId());
+            statement.setString(2, message.type());
+            statement.setString(3, message.payload());
+            statement.setLong(4, System.currentTimeMillis());
+            statement.executeUpdate();
+        }
     }
 
-    public List<SyncMessage> pollSince(long lastId, long maxAgeMs) {
-        try (Connection conn = db.getConnection(); PreparedStatement ps = conn.prepareStatement("SELECT id,server_id,type,payload FROM nixperms_sync WHERE id>? AND created_at>? ORDER BY id ASC")) {
-            ps.setLong(1, lastId); ps.setLong(2, System.currentTimeMillis() - maxAgeMs);
-            ResultSet rs = ps.executeQuery(); List<SyncMessage> messages = new ArrayList<>();
-            while (rs.next()) messages.add(new SyncMessage(rs.getLong("id"), rs.getString("server_id"), rs.getString("type"), rs.getString("payload")));
-            return messages;
-        } catch (SQLException e) { db.log().error("Failed to poll sync: {}", e.getMessage()); return List.of(); }
+    public List<SyncMessage> pollSince(
+            Connection connection,
+            long lastId,
+            int limit
+    ) throws SQLException {
+        List<SyncMessage> messages = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT id,server_id,type,payload FROM nixperms_sync " +
+                        "WHERE id>? ORDER BY id ASC LIMIT ?"
+        )) {
+            statement.setLong(1, lastId);
+            statement.setInt(2, limit);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    messages.add(new SyncMessage(
+                            result.getLong("id"), result.getString("server_id"),
+                            result.getString("type"), result.getString("payload")
+                    ));
+                }
+            }
+        }
+        return messages;
     }
 
-    public void cleanup(long maxAgeMs) {
-        try (Connection conn = db.getConnection(); PreparedStatement ps = conn.prepareStatement("DELETE FROM nixperms_sync WHERE created_at<?")) {
-            ps.setLong(1, System.currentTimeMillis() - maxAgeMs); ps.executeUpdate();
-        } catch (SQLException e) { db.log().error("Failed to cleanup sync: {}", e.getMessage()); }
+    public long latestId(Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT COALESCE(MAX(id),0) FROM nixperms_sync"
+        ); ResultSet result = statement.executeQuery()) {
+            return result.next() ? result.getLong(1) : 0L;
+        }
     }
 
-    public long latestId() {
-        try (Connection conn = db.getConnection(); PreparedStatement ps = conn.prepareStatement("SELECT COALESCE(MAX(id),0) FROM nixperms_sync"); ResultSet rs = ps.executeQuery()) {
-            if (rs.next()) return rs.getLong(1);
-        } catch (SQLException e) { db.log().error("Failed to fetch latest sync id: {}", e.getMessage()); }
-        return 0L;
+    public int cleanup(Connection connection, long maxAgeMillis) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM nixperms_sync WHERE created_at<?"
+        )) {
+            statement.setLong(1, System.currentTimeMillis() - maxAgeMillis);
+            return statement.executeUpdate();
+        }
     }
 }

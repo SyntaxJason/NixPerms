@@ -2,144 +2,401 @@ package de.astranox.nixperms.core.user;
 
 import de.astranox.nixperms.api.event.EventCause;
 import de.astranox.nixperms.api.event.IEventBus;
+import de.astranox.nixperms.api.event.user.UserEffectivePermissionsChangeEvent;
 import de.astranox.nixperms.api.event.user.UserLoadEvent;
 import de.astranox.nixperms.api.event.user.UserUnloadEvent;
+import de.astranox.nixperms.api.event.user.UserUpdateEvent;
 import de.astranox.nixperms.api.group.GroupRole;
 import de.astranox.nixperms.api.group.IPermissionGroup;
+import de.astranox.nixperms.api.permission.IPermissionData;
+import de.astranox.nixperms.api.permission.PermissionContext;
 import de.astranox.nixperms.api.permission.ResolutionPolicy;
-import de.astranox.nixperms.api.user.*;
+import de.astranox.nixperms.api.user.INixUser;
+import de.astranox.nixperms.api.user.IUserEditor;
+import de.astranox.nixperms.api.user.IUserManager;
+import de.astranox.nixperms.api.user.IUserSnapshot;
 import de.astranox.nixperms.core.group.NixGroupManager;
 import de.astranox.nixperms.core.model.UserModel;
 import de.astranox.nixperms.core.permission.NixPermissionData;
 import de.astranox.nixperms.core.permission.NixPermissionResolver;
+import de.astranox.nixperms.core.profile.IProfileResolver;
+import de.astranox.nixperms.core.profile.MojangProfileResolver;
+import de.astranox.nixperms.core.profile.ResolvedProfile;
 import de.astranox.nixperms.core.storage.IUserStorage;
-import de.astranox.nixperms.core.util.MojangProfileService;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import de.astranox.nixperms.core.util.StripedLock;
 import org.jetbrains.annotations.Nullable;
-import java.lang.ref.SoftReference;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 public final class NixUserManager implements IUserManager {
 
-    private static final long NEGATIVE_TTL_MS = 5 * 60 * 1000L;
+    private static final int MAX_REFRESH_RETRIES = 3;
 
     private final IUserStorage storage;
-    private final NixGroupManager groupManager;
+    private final NixGroupManager groups;
     private final NixPermissionResolver resolver;
+    private final NixMetaResolver metaResolver;
     private final IEventBus eventBus;
-    private final ResolutionPolicy defaultPolicy;
-    private final Executor dbExecutor;
-    private final Object2ObjectOpenHashMap<UUID, NixUser> cache = new Object2ObjectOpenHashMap<>();
-    private final ConcurrentHashMap<UUID, SoftReference<NixUserSnapshot>> snapshotCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Long> negativeNameCache = new ConcurrentHashMap<>();
+    private final ResolutionPolicy policy;
+    private final Executor storageExecutor;
+    private final Executor computeExecutor;
+    private final IProfileResolver profileResolver;
+    private final PermissionContext initialContext;
+    private final ConcurrentHashMap<UUID, NixUser> users = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, CompletableFuture<NixUser>> pendingLoads = new ConcurrentHashMap<>();
+    private final StripedLock mutationLocks = new StripedLock(64);
 
-    public NixUserManager(IUserStorage storage, NixGroupManager groupManager, NixPermissionResolver resolver, IEventBus eventBus, ResolutionPolicy defaultPolicy, Executor dbExecutor) {
-        this.storage = storage;
-        this.groupManager = groupManager;
-        this.resolver = resolver;
-        this.eventBus = eventBus;
-        this.defaultPolicy = defaultPolicy;
-        this.dbExecutor = dbExecutor;
+    public NixUserManager(
+            IUserStorage storage,
+            NixGroupManager groups,
+            NixPermissionResolver resolver,
+            IEventBus eventBus,
+            ResolutionPolicy policy,
+            Executor storageExecutor,
+            Executor computeExecutor,
+            String serverId
+    ) {
+        this(
+                storage, groups, resolver, eventBus, policy, storageExecutor, computeExecutor,
+                serverId, new MojangProfileResolver()
+        );
     }
 
-    @Override public @Nullable INixUser getUser(UUID uniqueId) { synchronized (cache) { return cache.get(uniqueId); } }
+    public NixUserManager(
+            IUserStorage storage,
+            NixGroupManager groups,
+            NixPermissionResolver resolver,
+            IEventBus eventBus,
+            ResolutionPolicy policy,
+            Executor storageExecutor,
+            Executor computeExecutor,
+            String serverId,
+            IProfileResolver profileResolver
+    ) {
+        if (profileResolver == null) throw new IllegalArgumentException("Profile resolver cannot be null");
+        this.storage = storage;
+        this.groups = groups;
+        this.resolver = resolver;
+        this.metaResolver = new NixMetaResolver(groups);
+        this.eventBus = eventBus;
+        this.policy = policy;
+        this.storageExecutor = storageExecutor;
+        this.computeExecutor = computeExecutor;
+        this.profileResolver = profileResolver;
+        this.initialContext = PermissionContext.server(serverId);
+    }
+
+    @Override public @Nullable INixUser getUser(UUID uniqueId) { return users.get(uniqueId); }
 
     @Override
     public CompletableFuture<INixUser> loadUser(UUID uniqueId) {
-        synchronized (cache) { NixUser cached = cache.get(uniqueId); if (cached != null) return CompletableFuture.completedFuture(cached); }
-        return storage.load(uniqueId).thenApply(model -> {
-            UserModel resolved = model != null ? model : new UserModel(uniqueId, groupManager.defaultGroup().name(), null, Map.of());
-            NixUser user = buildUser(resolved);
-            synchronized (cache) { cache.put(uniqueId, user); }
-            eventBus.post(new UserLoadEvent(user, EventCause.API));
-            return (INixUser) user;
-        });
+        if (uniqueId == null) return CompletableFuture.failedFuture(new IllegalArgumentException("UUID cannot be null"));
+        NixUser loaded = users.get(uniqueId);
+        if (loaded != null) return CompletableFuture.completedFuture(loaded);
+        return pendingLoads.computeIfAbsent(uniqueId, this::startLoad).thenApply(user -> user);
+    }
+
+    @Override
+    public CompletableFuture<INixUser> reloadUser(UUID uniqueId) {
+        NixUser loaded = users.get(uniqueId);
+        if (loaded == null) return loadUser(uniqueId);
+
+        return CompletableFuture.supplyAsync(() -> {
+            UserModel model = storage.load(uniqueId);
+            return model == null ? UserModel.create(uniqueId, groups.defaultGroup().name()) : model;
+        }, storageExecutor).thenApplyAsync(model -> withLock(uniqueId, () -> {
+            NixUser current = users.get(uniqueId);
+            if (current == null) {
+                NixUser created = buildUser(sanitize(model));
+                NixUser existing = users.putIfAbsent(uniqueId, created);
+                if (existing != null) {
+                    created.deactivate();
+                    return existing;
+                }
+                eventBus.post(new UserLoadEvent(created, EventCause.RELOAD));
+                return created;
+            }
+            current.apply(sanitize(model));
+            refreshUser(current);
+            return current;
+        }), computeExecutor);
+    }
+
+    @Override
+    public CompletableFuture<INixUser> edit(UUID uniqueId, Consumer<IUserEditor> change) {
+        if (change == null) return CompletableFuture.failedFuture(new IllegalArgumentException("Editor cannot be null"));
+        return loadUser(uniqueId).thenCompose(ignored -> CompletableFuture.supplyAsync(
+                () -> mutate(uniqueId, change), storageExecutor
+        ));
     }
 
     @Override
     public CompletableFuture<Void> saveUser(INixUser user) {
-        return storage.save(new UserModel(user.uniqueId(), user.primary().name(), user.secondaryExplicit() != null ? user.secondaryExplicit().name() : null, user.ownPermissions()));
+        if (!(user instanceof NixUser nixUser)) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Foreign user implementation"));
+        }
+        return CompletableFuture.runAsync(() -> withLock(nixUser.uniqueId(), () -> {
+            storage.save(nixUser.model(), true);
+            return null;
+        }), storageExecutor);
     }
 
     @Override
     public CompletableFuture<@Nullable IUserSnapshot> fetchSnapshot(UUID uniqueId) {
-        synchronized (cache) { NixUser online = cache.get(uniqueId); if (online != null) return CompletableFuture.completedFuture(online.snapshot()); }
-        SoftReference<NixUserSnapshot> ref = snapshotCache.get(uniqueId);
-        if (ref != null) { NixUserSnapshot snap = ref.get(); if (snap != null) return CompletableFuture.completedFuture(snap); }
-        return storage.load(uniqueId).thenApply(model -> {
-            if (model == null) return null;
-            NixUserSnapshot snap = (NixUserSnapshot) buildUser(model).snapshot();
-            snapshotCache.put(uniqueId, new SoftReference<>(snap));
-            return (IUserSnapshot) snap;
-        });
+        NixUser loaded = users.get(uniqueId);
+        if (loaded != null) return CompletableFuture.completedFuture(loaded.snapshot());
+
+        return CompletableFuture.supplyAsync(() -> storage.load(uniqueId), storageExecutor)
+                .thenApplyAsync(model -> {
+                    if (model == null) return null;
+                    NixUser temporary = buildUser(sanitize(model));
+                    IUserSnapshot snapshot = temporary.snapshot();
+                    temporary.deactivate();
+                    return snapshot;
+                }, computeExecutor);
     }
 
     @Override
     public CompletableFuture<@Nullable INixUser> resolveUser(String nameOrUuid) {
-        try { return loadUser(UUID.fromString(nameOrUuid)); } catch (IllegalArgumentException ignored) {}
-        synchronized (cache) { INixUser byName = cache.values().stream().filter(u -> nameOrUuid.equalsIgnoreCase(u.name())).findFirst().orElse(null); if (byName != null) return CompletableFuture.completedFuture(byName); }
-        Long negAt = negativeNameCache.get(nameOrUuid.toLowerCase());
-        if (negAt != null && System.currentTimeMillis() - negAt < NEGATIVE_TTL_MS) return CompletableFuture.completedFuture(null);
-        return CompletableFuture.supplyAsync(() -> MojangProfileService.getUniqueId(nameOrUuid), dbExecutor).thenCompose(uuid -> {
-            if (uuid == null) { negativeNameCache.put(nameOrUuid.toLowerCase(), System.currentTimeMillis()); return CompletableFuture.completedFuture(null); }
-            return loadUser(uuid);
+        if (nameOrUuid == null || nameOrUuid.isBlank()) return CompletableFuture.completedFuture(null);
+        String input = nameOrUuid.trim();
+        try {
+            return loadUser(UUID.fromString(input)).thenApply(user -> user);
+        } catch (IllegalArgumentException ignored) {
+            // Continue with name resolution.
+        }
+
+        for (NixUser user : users.values()) {
+            if (user.name() != null && user.name().equalsIgnoreCase(input)) {
+                return CompletableFuture.completedFuture(user);
+            }
+        }
+
+        return CompletableFuture.supplyAsync(
+                () -> storage.loadByName(input.toLowerCase(Locale.ROOT)), storageExecutor
+        ).thenCompose(model -> {
+            if (model != null) return loadUser(model.uniqueId()).thenApply(user -> user);
+            return profileResolver.resolve(input).thenCompose(this::loadResolvedProfile);
+        });
+    }
+
+
+    private CompletableFuture<@Nullable INixUser> loadResolvedProfile(@Nullable ResolvedProfile profile) {
+        if (profile == null) return CompletableFuture.completedFuture(null);
+        return loadUser(profile.uniqueId()).thenCompose(user -> {
+            if (profile.name().equals(user.name())) return CompletableFuture.completedFuture(user);
+            return edit(profile.uniqueId(), editor -> editor.name(profile.name()));
         });
     }
 
     @Override
     public void unloadUser(UUID uniqueId) {
-        NixUser user;
-        synchronized (cache) { user = cache.remove(uniqueId); }
-        if (user != null) eventBus.post(new UserUnloadEvent(user.snapshot(), EventCause.API));
+        NixUser removed = users.remove(uniqueId);
+        if (removed != null) {
+            unload(removed);
+            return;
+        }
+        CompletableFuture<NixUser> pending = pendingLoads.get(uniqueId);
+        if (pending != null) {
+            pending.whenComplete((user, error) -> {
+                if (error == null) unloadLoaded(uniqueId);
+            });
+            return;
+        }
+        unloadLoaded(uniqueId);
     }
 
-    @Override public Collection<INixUser> loaded() { synchronized (cache) { return List.copyOf(cache.values()); } }
+    private void unloadLoaded(UUID uniqueId) {
+        NixUser removed = users.remove(uniqueId);
+        if (removed != null) unload(removed);
+    }
+
+    private void unload(NixUser removed) {
+        IUserSnapshot snapshot = removed.snapshot();
+        removed.deactivate();
+        eventBus.post(new UserUnloadEvent(snapshot, EventCause.API));
+    }
+
+    @Override public Collection<INixUser> loaded() { return List.copyOf(users.values()); }
+
+    public @Nullable NixUser internalUser(UUID uniqueId) { return users.get(uniqueId); }
 
     public void invalidateGroup(String groupName) {
-        synchronized (cache) { cache.values().stream().filter(u -> isInChain(u, groupName)).forEach(this::refreshUser); }
+        CompletableFuture<?>[] refreshes = List.copyOf(users.values()).stream()
+                .map(user -> CompletableFuture.runAsync(() -> withLock(user.uniqueId(), () -> {
+                    NixUser current = users.get(user.uniqueId());
+                    if (current == null || !usesGroup(current, groupName)) return null;
+                    UserModel model = current.model();
+                    UserModel sanitized = sanitize(model);
+                    if (!sanitized.equals(model)) current.apply(sanitized);
+                    current.bumpRevision();
+                    refreshUser(current);
+                    return null;
+                }), computeExecutor))
+                .toArray(CompletableFuture[]::new);
+        CompletableFuture.allOf(refreshes).join();
     }
 
-    private boolean isInChain(NixUser user, String groupName) {
-        if (groupManager.getChain(user.primary()).stream().anyMatch(g -> g.name().equals(groupName))) return true;
-        IPermissionGroup sec = user.secondaryEffective();
-        if (sec == null) return false;
-        return groupManager.getChain(sec).stream().anyMatch(g -> g.name().equals(groupName));
+    public void refreshAll() {
+        users.values().forEach(NixUser::invalidate);
     }
 
-    private void refreshUser(NixUser user) {
-        NixPermissionData permData = resolver.compute(user.primary(), user.secondaryEffective(), user.ownPermissionsRaw(), List.of(), defaultPolicy);
-        NixMetaData metaData = buildMetaData(user.primary(), user.secondaryEffective());
-        user.refreshCache(permData, metaData);
+    public CompletableFuture<Void> reloadAllLoaded() {
+        CompletableFuture<?>[] reloads = users.keySet().stream()
+                .map(this::reloadUser)
+                .toArray(CompletableFuture[]::new);
+        return CompletableFuture.allOf(reloads);
+    }
+
+    private CompletableFuture<NixUser> startLoad(UUID uniqueId) {
+        CompletableFuture<NixUser> future = CompletableFuture.supplyAsync(() -> {
+            UserModel model = storage.load(uniqueId);
+            if (model != null) return model;
+            UserModel created = UserModel.create(uniqueId, groups.defaultGroup().name());
+            storage.save(created, true);
+            return created;
+        }, storageExecutor).thenApplyAsync(model -> {
+            NixUser created = buildUser(sanitize(model));
+            NixUser existing = users.putIfAbsent(uniqueId, created);
+            if (existing != null) {
+                created.deactivate();
+                return existing;
+            }
+            eventBus.post(new UserLoadEvent(created, EventCause.API));
+            return created;
+        }, computeExecutor);
+        future.whenComplete((result, error) -> pendingLoads.remove(uniqueId, future));
+        return future;
+    }
+
+    private INixUser mutate(UUID uniqueId, Consumer<IUserEditor> change) {
+        return withLock(uniqueId, () -> {
+            NixUser user = users.get(uniqueId);
+            if (user == null) throw new IllegalStateException("User was unloaded during edit: " + uniqueId);
+            IUserSnapshot previous = user.snapshot();
+            NixUserEditor editor = new NixUserEditor(user.model());
+            change.accept(editor);
+            UserModel updated = editor.build();
+            new NixUserValidator(groups).validate(updated);
+            storage.save(updated, true);
+            user.apply(updated);
+            refreshUser(user);
+            eventBus.post(new UserUpdateEvent(previous, user.snapshot(), EventCause.API));
+            return user;
+        });
     }
 
     private NixUser buildUser(UserModel model) {
-        IPermissionGroup primary = resolvePrimary(model.primaryGroupName());
-        IPermissionGroup secondary = model.secondaryGroupName() != null ? groupManager.group(model.secondaryGroupName()) : null;
-        IPermissionGroup effectiveSec = secondary != null ? secondary : primary.parent().orElse(null);
-        NixPermissionData permData = resolver.compute(primary, effectiveSec, model.permissions(), List.of(), defaultPolicy);
-        NixMetaData metaData = buildMetaData(primary, effectiveSec);
-        AtomicReference<NixUser> ref = new AtomicReference<>();
-        NixUser user = new NixUser(model.uniqueId(), primary, secondary, model.permissions(), permData, metaData, new NixUserCallbacks(
-                (p, s) -> storage.save(new UserModel(model.uniqueId(), p.name(), s != null ? s.name() : null, ref.get().ownPermissionsRaw())),
-                perms -> storage.save(new UserModel(model.uniqueId(), ref.get().primary().name(), ref.get().secondaryExplicit() != null ? ref.get().secondaryExplicit().name() : null, perms)),
-                () -> refreshUser(ref.get())));
-        ref.set(user);
+        NixUser user = new NixUser(
+                model, groups, initialContext,
+                change -> edit(model.uniqueId(), change), this::scheduleRefresh
+        );
+        refreshUser(user);
         return user;
     }
 
-    private NixMetaData buildMetaData(IPermissionGroup primary, @Nullable IPermissionGroup secondary) {
-        String prefix = secondary != null && !secondary.meta().primaryPrefix().isEmpty() ? secondary.meta().primaryPrefix() : primary.meta().primaryPrefix();
-        String suffix = secondary != null && !secondary.meta().primarySuffix().isEmpty() ? secondary.meta().primarySuffix() : primary.meta().primarySuffix();
-        Map<String, String> options = new HashMap<>(primary.meta().options());
-        if (secondary != null) options.putAll(secondary.meta().options());
-        return new NixMetaData(prefix, suffix, Map.copyOf(options));
+    private void scheduleRefresh(NixUser user) {
+        if (!user.active() || !user.requestRefreshWorker()) return;
+        computeExecutor.execute(() -> drainRefreshes(user));
     }
 
-    private IPermissionGroup resolvePrimary(String name) {
-        IPermissionGroup group = groupManager.group(name);
+    private void drainRefreshes(NixUser user) {
+        try {
+            while (user.active() && user.consumeRefreshRequest()) {
+                refreshUser(user);
+            }
+        } finally {
+            user.releaseRefreshWorker();
+            if (user.active() && user.refreshPending()) scheduleRefresh(user);
+        }
+    }
+
+    private void refreshUser(NixUser user) {
+        if (!user.active()) return;
+        for (int attempt = 0; attempt < MAX_REFRESH_RETRIES; attempt++) {
+            NixUser.RefreshInput input = user.refreshInput();
+            IPermissionGroup primary = primary(input.model());
+            IPermissionGroup secondary = secondary(input.model(), primary);
+            NixPermissionData permissions = resolver.compute(
+                    primary, secondary, input.model().rules(), input.attachments(),
+                    input.context(), policy
+            );
+            NixMetaData meta = metaResolver.resolve(primary, secondary);
+            IPermissionData previous = user.publish(input.revision(), permissions, meta);
+            if (previous == null) continue;
+            if (!previous.effective().equals(permissions.effective())) {
+                eventBus.post(new UserEffectivePermissionsChangeEvent(user, previous, permissions));
+            }
+            return;
+        }
+    }
+
+    private UserModel sanitize(UserModel model) {
+        IPermissionGroup primary = groups.group(model.primaryGroupName());
+        String secondaryName = model.secondaryGroupName();
+        IPermissionGroup secondary = secondaryName == null ? null : groups.group(secondaryName);
+        if (secondaryName != null && (secondary == null || secondary.role() != GroupRole.SECONDARY)) {
+            secondaryName = null;
+        }
+        if (primary == null || primary.role() != GroupRole.PRIMARY) {
+            return new UserModel(
+                    model.uniqueId(), model.name(), groups.defaultGroup().name(),
+                    secondaryName, model.rules()
+            );
+        }
+        if (model.secondaryGroupName() != null && secondaryName == null) {
+            return new UserModel(
+                    model.uniqueId(), model.name(), model.primaryGroupName(), null, model.rules()
+            );
+        }
+        return model;
+    }
+
+    private IPermissionGroup primary(UserModel model) {
+        IPermissionGroup group = groups.group(model.primaryGroupName());
         if (group != null && group.role() == GroupRole.PRIMARY) return group;
-        return groupManager.defaultGroup();
+        return groups.defaultGroup();
+    }
+
+    private @Nullable IPermissionGroup secondary(UserModel model, IPermissionGroup primary) {
+        String secondaryName = model.secondaryGroupName();
+        if (secondaryName != null) {
+            IPermissionGroup explicit = groups.group(secondaryName);
+            if (explicit != null && explicit.role() == GroupRole.SECONDARY) return explicit;
+        }
+        return primary.defaultSecondary().filter(group -> group.role() == GroupRole.SECONDARY).orElse(null);
+    }
+
+    private boolean usesGroup(NixUser user, String groupName) {
+        UserModel model = user.model();
+        if (model.primaryGroupName().equals(groupName)) return true;
+        if (groupName.equals(model.secondaryGroupName())) return true;
+        for (IPermissionGroup group : groups.getChain(primary(model))) {
+            if (group.name().equals(groupName)) return true;
+        }
+        IPermissionGroup secondary = secondary(model, primary(model));
+        if (secondary == null) return false;
+        for (IPermissionGroup group : groups.getChain(secondary)) {
+            if (group.name().equals(groupName)) return true;
+        }
+        return false;
+    }
+
+    private <T> T withLock(UUID uniqueId, java.util.function.Supplier<T> action) {
+        ReentrantLock lock = mutationLocks.forKey(uniqueId);
+        lock.lock();
+        try {
+            return action.get();
+        } finally {
+            lock.unlock();
+        }
     }
 }

@@ -1,5 +1,5 @@
 name: NixPerms
-version: 1.0.0
+version: '${project.version}'
 main: de.astranox.nixperms.bungeecord.NixPermsBungee
 author: Astranox
-description: A powerful permission management plugin for BungeeCord networks.
+description: Fast, predictable permissions for modern Minecraft networks.

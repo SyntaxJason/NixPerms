@@ -1,13 +1,19 @@
 name: NixPerms
-version: 2.0-EXPERIMENTAL
+version: '${project.version}'
 main: de.astranox.nixperms.paper.NixPermsBukkit
-api-version: 1.14
-authors: [ Astranox ]
-description: A modern permission system for Paper servers.
+api-version: '1.21'
+load: STARTUP
+authors: [Astranox]
+description: Fast, predictable permissions for modern Minecraft networks.
 
 commands:
   nixperms:
-    description: NixPerms main command
+    description: Manage NixPerms users and groups
     permission: nixperms.admin
     usage: /nixperms <user|group|reload>
-    aliases: [ nix, nixpurrms ]
+    aliases: [nixp]
+
+permissions:
+  nixperms.admin:
+    description: Allows all NixPerms administration commands
+    default: op

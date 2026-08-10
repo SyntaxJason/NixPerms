@@ -1,86 +1,131 @@
 package de.astranox.nixperms.paper;
 
+import de.astranox.nixperms.api.INixPermsAPI;
+import de.astranox.nixperms.api.NixPermsProvider;
+import de.astranox.nixperms.api.permission.PermissionContext;
+import de.astranox.nixperms.api.user.INixUser;
 import de.astranox.nixperms.core.NixPermsCore;
-import de.astranox.nixperms.core.command.subcommand.*;
-import de.astranox.nixperms.core.config.WebConfig;
-import de.astranox.nixperms.core.util.ServerAddressResolver;
-import de.astranox.nixperms.core.web.WebEditorBridge;
-import de.astranox.nixperms.web.NixWebServer;
-import de.astranox.nixperms.web.WebEditorBridgeImpl;
-import de.astranox.nixperms.web.auth.SessionManager;
+import de.astranox.nixperms.platform.common.PlatformCommandRegistrar;
+import de.astranox.nixperms.platform.common.PlatformSettingsLoader;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
+import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
-import java.lang.reflect.Field;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.logging.Level;
 
 public final class NixPermsBukkit extends JavaPlugin {
 
     private NixPermsCore core;
-    private NixWebServer webServer;
-    private WebEditorBridge webBridge;
+    private PermissibleInjector injector;
+    private BukkitCommandTreeUpdater commandTreeUpdater;
 
     @Override
     public void onEnable() {
-        NixPermsCore.create(getDataFolder().toPath()).thenAccept(c -> {
-            this.core = c;
-            startWebServerIfEnabled();
-            registerSubcommands();
-            registerBukkitCommand();
-            registerListeners();
-            startWebServer();
-            getLogger().info("NixPerms enabled.");
-        }).exceptionally(ex -> { getLogger().severe("Failed to enable NixPerms: " + ex.getMessage()); return null; });
-    }
-
-    private void startWebServerIfEnabled() {
-        WebConfig webCfg = core.config().web;
-        if (!webCfg.enabled) return;
-
-        this.webServer = new NixWebServer(core, webCfg);
-        this.webServer.start(webCfg.port);
-
-        SessionManager sessions = webServer.sessions();
-        this.webBridge = new WebEditorBridgeImpl(webServer, webCfg, sessions);
-
-        getLogger().info("Web Editor running on http://" + webBridge.serverAddress() + ":" + webBridge.port() + "/webeditor");
+        try {
+            core = NixPermsCore.create(PlatformSettingsLoader.load(
+                    getDataFolder().toPath(), () -> getResource("config.yml")
+            )).join();
+            injector = new PermissibleInjector(core, getLogger());
+            commandTreeUpdater = new BukkitCommandTreeUpdater(this, core);
+            exposeApi();
+            registerCommands();
+            getServer().getPluginManager().registerEvents(
+                    new BukkitPlayerListener(this, core, injector, commandTreeUpdater), this
+            );
+            attachOnlinePlayers();
+            getLogger().info("NixPerms v" + core.version() + " enabled on server '" + core.serverId() + "'.");
+        } catch (Throwable error) {
+            Throwable cause = unwrap(error);
+            getLogger().log(Level.SEVERE, "NixPerms could not start", cause);
+            cleanup();
+            getServer().getPluginManager().disablePlugin(this);
+        }
     }
 
     @Override
     public void onDisable() {
-        if (webServer != null) webServer.stop();
-        if (core != null) core.shutdown();
+        cleanup();
     }
 
-    private void registerSubcommands() {
-        core.commands().register(new GroupSubcommand());
-        core.commands().register(new UserSubcommand());
-        core.commands().register(new ReloadSubcommand(core, getDataFolder().toPath()));
-        if (core.config().web.enabled && webServer != null) {
-            String address = ServerAddressResolver.resolve(core.config().web);
-            core.commands().register(new WebEditorSubcommand(webBridge));
+    private void exposeApi() {
+        NixPermsProvider.register(core);
+        getServer().getServicesManager().register(
+                INixPermsAPI.class, core, this, ServicePriority.Normal
+        );
+    }
+
+    private void registerCommands() {
+        PlatformCommandRegistrar.register(core);
+        if (PaperRuntime.registerCommands(this, core)) {
+            getLogger().info("Registered /nixperms through Paper's native command API.");
+            return;
+        }
+
+        registerLegacyBukkitCommand();
+        getLogger().info("Registered /nixperms through the Bukkit command adapter.");
+    }
+
+    private void registerLegacyBukkitCommand() {
+        PluginCommand command = getCommand("nixperms");
+        if (command == null) {
+            throw new IllegalStateException("Command 'nixperms' is missing from plugin.yml");
+        }
+        BukkitCommandExecutor executor = new BukkitCommandExecutor(this, core);
+        command.setExecutor(executor);
+        command.setTabCompleter(executor);
+    }
+
+    private void attachOnlinePlayers() {
+        List<Player> online = List.copyOf(getServer().getOnlinePlayers());
+        CompletableFuture<?>[] loads = online.stream()
+                .map(this::loadPlayer)
+                .toArray(CompletableFuture[]::new);
+        CompletableFuture.allOf(loads).join();
+        for (Player player : online) {
+            core.users().getUser(player.getUniqueId()).updateContext(new PermissionContext(
+                    core.serverId(), player.getWorld().getName()
+            ));
+            if (injector.inject(player)) commandTreeUpdater.request(player);
         }
     }
 
-    private void registerBukkitCommand() {
-        BukkitCommandExecutor executor = new BukkitCommandExecutor(core);
-        PluginCommand command = getCommand("nixperms");
-        if (command != null) { command.setExecutor(executor); command.setTabCompleter(executor); }
+
+    private CompletableFuture<INixUser> loadPlayer(Player player) {
+        return core.users().loadUser(player.getUniqueId()).thenCompose(user -> {
+            if (player.getName().equals(user.name())) {
+                return CompletableFuture.completedFuture(user);
+            }
+            return user.edit(editor -> editor.name(player.getName()));
+        });
     }
 
-    private void registerListeners() {
-        getServer().getPluginManager().registerEvents(new BukkitPlayerListener(core), this);
-        getServer().getOnlinePlayers().forEach(player -> PermissibleInjector.inject(player, core, getLogger()));
+    private void cleanup() {
+        if (commandTreeUpdater != null) {
+            commandTreeUpdater.close();
+            commandTreeUpdater = null;
+        }
+        if (injector != null) {
+            injector.close();
+            injector = null;
+        }
+        if (core != null) {
+            getServer().getServicesManager().unregisterAll(this);
+            NixPermsProvider.unregister(core);
+            core.close();
+            core = null;
+        }
     }
 
-    private void startWebServer() {
-        WebConfig webConfig = core.config().web;
-        if (!webConfig.enabled) return;
-        webServer = new NixWebServer(core, webConfig);
-        webServer.start(webConfig.port);
-        String address = ServerAddressResolver.resolve(webConfig);
-        String url = "http://" + address + ":" + webConfig.port + "/webeditor";
-        getLogger().info("Web Editor available at: " + url);
-        String address2 = ServerAddressResolver.resolve(webConfig);
-        core.commands().register(new WebEditorSubcommand(webBridge));
+    private Throwable unwrap(Throwable error) {
+        Throwable current = error;
+        while (current.getCause() != null &&
+                (current instanceof java.util.concurrent.CompletionException ||
+                        current instanceof java.util.concurrent.ExecutionException)) {
+            current = current.getCause();
+        }
+        return current;
     }
 }
